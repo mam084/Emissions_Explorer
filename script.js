@@ -15,19 +15,20 @@
 
   // Stable color mapping per (groupBy::key)
   const colorCache = new Map();
-  function hash32(str){
-    let h = 2166136261 >>> 0;
-    for (let i=0; i<str.length; i++){
-      h ^= str.charCodeAt(i);
-      h = Math.imul(h, 16777619);
-    }
-    return h >>> 0;
-  }
+  // Distinct colors that read well on the dark background. Assigned in the
+  // order keys are first seen for each grouping, so a sector keeps its color
+  // when you switch regions.
+  const PALETTE = ["#5b8ff9", "#f6bd16", "#5ad8a6", "#e8684a", "#9270ca",
+                   "#6dc8ec", "#ff9d4d", "#ff99c3", "#a3b1bf", "#269a99"];
+  const OTHER_COLOR = "#4a5163";
+  const colorIndex = new Map();
   function colorFor(groupBy, key){
+    if (key === "Other") return OTHER_COLOR;
     const K = (groupBy||"") + "::" + (key||"");
     if (colorCache.has(K)) return colorCache.get(K);
-    const h = hash32(K) % 360;
-    const c = `hsl(${h}, 62%, 56%)`;
+    const n = colorIndex.get(groupBy) || 0;
+    colorIndex.set(groupBy, n + 1);
+    const c = PALETTE[n % PALETTE.length];
     colorCache.set(K, c);
     return c;
   }
@@ -38,9 +39,7 @@
     marginOverview: {top: 4, right: 18, bottom: 24, left: 72},
     height: 420,
     heightOverview: 90,
-    MAX_PCT: 300,
-    EXCLUDE_TOTAL_RE: /(total|all|overall|aggregate|summary)/i,
-    EXCLUDE_GAS_RE: /^(greenhouse\s*gas|total|all|overall|aggregate|summary)$/i
+    MAX_PCT: 300
   };
 
   const W = getWidth();
@@ -78,11 +77,10 @@
 
   const clipId = "clipMain";
   svg.append("clipPath").attr("id", clipId)
-     .append("rect").attr("x", CFG.margin.left).attr("y", CFG.margin.top)
+     .append("rect").attr("x", 0).attr("y", 0)
      .attr("width", innerW).attr("height", innerH);
 
   const gSeries = gMain.append("g").attr("clip-path", `url(#${clipId})`);
-  const gLegend = gMain.append("g").attr("transform", "translate(0,-10)");
 
   const tooltip = d3.select("#tooltip").empty()
     ? d3.select("body").append("div").attr("id","tooltip") : d3.select("#tooltip");
@@ -131,6 +129,21 @@
       return HAVE_INDUSTRY ? "Industry" : (HAVE_GAS ? "Gas Type" : null);
     }
 
+    // The source file has overlapping rows: every series appears both
+    // seasonally adjusted and not, every industry has a "Greenhouse gas" total
+    // alongside the individual gases, and every gas has a "Total Industry and
+    // Households" row alongside the sectors. Summing everything would count the
+    // same emissions several times over, so each view picks one consistent slice:
+    //   by industry -> total GHG for each sector (no all-sector total)
+    //   by gas      -> all sectors combined for each gas (no all-gas total)
+    const TOTAL_GAS = "Greenhouse gas";
+    const TOTAL_INDUSTRY = "Total Industry and Households";
+    function displayIndustry(name){ return name === "Total Households" ? "Households" : name; }
+    function inView(d, groupBy){
+      if (groupBy === "Industry") return d.gas === TOTAL_GAS && d.industry !== TOTAL_INDUSTRY;
+      return d.industry === TOTAL_INDUSTRY && d.gas !== TOTAL_GAS;
+    }
+
     // Long format
     const long = [];
     for (const row of raw) {
@@ -143,8 +156,9 @@
         if (!dt) continue;
         long.push({
           region,
-          industry: ((row["Industry"]||"")+"").trim() || null,
+          industry: displayIndustry(((row["Industry"]||"")+"").trim()) || null,
           gas: ((row["Gas Type"]||"")+"").trim() || null,
+          sa: ((row["Seasonal Adjustment"]||"")+"").trim(),
           quarter: dt,
           value: v
         });
@@ -172,7 +186,10 @@
 
       if (!groupBy) return clearViz("No valid grouping available in this dataset.");
 
-      const data = long.filter(d => d.region.trim().toLowerCase() === regionNorm);
+      const saSelect = d3.select("#saSelect");
+      const saWanted = saSelect.empty() ? "Seasonally Adjusted" : saSelect.property("value");
+      const data = long.filter(d =>
+        d.region.trim().toLowerCase() === regionNorm && d.sa === saWanted && inView(d, groupBy));
       
       if (!data.length) {
         // Auto-fallback to first region that has data
@@ -206,14 +223,10 @@
         d => +d.quarter
       );
 
-      function buildSeries(excludeTotals){
+      function buildSeries(){
         const out = [];
         groupedRaw.forEach((byQ, keyRaw) => {
           let key = keyRaw || "Unspecified";
-          if (excludeTotals) {
-            if (groupBy === "Industry" && CFG.EXCLUDE_TOTAL_RE.test(String(key))) return;
-            if (groupBy === "Gas Type" && CFG.EXCLUDE_GAS_RE.test(String(key))) return;
-          }
           const arr = Array.from(byQ, ([ts, val]) => ({ quarter: new Date(+ts), value: +val }))
                           .sort((a,b)=>a.quarter-b.quarter);
           if (!arr.length) return;
@@ -230,8 +243,7 @@
         return out;
       }
 
-      let series = buildSeries(true);
-      if (!series.length) series = buildSeries(false);
+      const series = buildSeries();
 
       if (!series.length) return clearViz("No series available.");
 
@@ -241,7 +253,14 @@
         const vb = (metric==="absolute") ? b.latest.value : Math.abs(b.latest.pct || 0);
         return d3.descending(va, vb);
       });
-      const top = series.slice(0, CFG.topN);
+      let top = series.slice(0, CFG.topN);
+      const rest = series.slice(CFG.topN);
+      if (rest.length && metric === "absolute") {
+        const byQ = new Map();
+        for (const s of rest) for (const v of s.values) byQ.set(+v.quarter, (byQ.get(+v.quarter) || 0) + v.value);
+        const values = Array.from(byQ, ([ts, value]) => ({ quarter: new Date(ts), value })).sort((a,b)=>a.quarter-b.quarter);
+        top = top.concat([{ key: "Other", values, latest: values[values.length-1] }]);
+      }
       const keys = top.map(d => d.key);
 
       const quarters = top[0] ? top[0].values.map(d => d.quarter) : [];
@@ -333,7 +352,7 @@
       xAxisG.selectAll("*").remove();
       yAxisG.selectAll("*").remove();
       gOverview.selectAll("*").remove();
-      gLegend.selectAll("*").remove();
+      container.selectAll("div.legend").remove();
       container.selectAll(".warn").remove();
       container.append("div").attr("class","warn").style("color","#ffb4b4").style("padding","8px").text(msg);
       return;
@@ -349,24 +368,32 @@
     }
 
     function renderLegend(keys, groupBy, fillFor) {
-      gLegend.selectAll("*").remove();
-      const items = gLegend.selectAll("g.leg").data(keys, d=>d).join(enter => {
-        const g = enter.append("g").attr("class","leg").style("cursor","pointer");
-        g.append("rect").attr("width",12).attr("height",12).attr("y",-12);
-        g.append("text").attr("x",16).attr("y",-2).attr("fill","#aab2bd").attr("font-size",".9rem")
-         .attr("dominant-baseline","central").attr("title", d=>d);
-        return g;
+      // HTML legend above the chart so long sector names can wrap.
+      let legend = container.select("div.legend");
+      if (legend.empty()) {
+        legend = container.insert("div", "svg").attr("class", "legend")
+          .style("display", "flex").style("flex-wrap", "wrap").style("gap", ".35rem 1rem")
+          .style("padding", "12px 16px 0").style("font-size", ".85rem").style("color", "#aab2bd");
+      }
+      const items = legend.selectAll("span.leg").data(keys, d => d)
+        .join(enter => {
+          const it = enter.append("span").attr("class", "leg")
+            .style("cursor", "pointer").style("display", "inline-flex").style("align-items", "center");
+          it.append("i").style("display", "inline-block").style("width", "12px").style("height", "12px")
+            .style("border-radius", "2px").style("margin-right", "6px");
+          it.append("span");
+          return it;
+        })
+        .style("opacity", 1)
+        .attr("title", "Click to dim or restore this series");
+      items.select("i").style("background", d => fillFor({ key: d }));
+      items.select("span").text(d => d);
+      items.on("click", function(_, key) {
+        const node = gSeries.selectAll("path.layer").filter(d => d.key === key);
+        const dim = +node.attr("opacity") >= 0.4;
+        node.transition().duration(160).attr("opacity", dim ? 0.2 : 0.9);
+        d3.select(this).style("opacity", dim ? 0.45 : 1);
       });
-      items.attr("transform",(d,i)=>`translate(${i*180},0)`)
-        .on("click", (_, key) => {
-          const node = gSeries.selectAll("path.layer").filter(d => d.key === key);
-          node.transition().duration(160).attr("opacity", function(){
-            const cur = +d3.select(this).attr("opacity");
-            return cur < 0.4 ? 0.9 : 0.2;
-          });
-        });
-      items.select("rect").attr("fill", d => fillFor({key:d}));
-      items.select("text").text(d => d.length>24 ? d.slice(0,22)+"…" : d);
     }
 
     function addHover(rows, keys, metric, groupBy, fillFor) {
@@ -410,6 +437,7 @@
     if (!regionSelect.empty()) regionSelect.on("change", update);
     if (!groupBySelect.empty()) groupBySelect.on("change", update);
     if (!metricSelect.empty()) metricSelect.on("change", update);
+    d3.select("#saSelect").on("change", update);
   })
   .catch(err => {
     container.append("div").style("padding","16px").style("color","#ffb4b4")
